@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>跳一跳</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;overflow:hidden;background:#e6e9ef;
+    font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',system-ui,sans-serif;}
+  #stage{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:min(100vw,60vh);height:min(100vh,calc(100vw / 0.6));
+    background:#f4f5f8;overflow:hidden;box-shadow:0 18px 60px rgba(0,0,0,.18);}
+  canvas{display:block;width:100%;height:100%;touch-action:none;}
+  .panel{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;
+    background:rgba(244,245,248,.94);backdrop-filter:blur(8px);}
+  .panel.hidden{display:none;}
+  .title{font-size:34px;font-weight:800;letter-spacing:6px;color:#3a3a44;}
+  .sub{font-size:14px;color:#8b8b96;line-height:2;text-align:center;}
+  .big{font-size:76px;font-weight:800;color:#3a3a44;line-height:1;}
+  .best{font-size:14px;color:#8b8b96;}
+  .newrec{font-size:13px;color:#e07b39;font-weight:700;}
+  .why{font-size:13px;color:#e07b39;min-height:18px;}
+  .btn{margin-top:10px;padding:13px 42px;border:none;border-radius:26px;cursor:pointer;
+    background:#5b3fd6;color:#fff;font-size:17px;font-weight:700;letter-spacing:2px;
+    box-shadow:0 8px 20px rgba(91,63,214,.32);}
+  .btn:active{transform:translateY(1px);box-shadow:0 4px 12px rgba(91,63,214,.3);}
+  .tip{position:absolute;bottom:16px;width:100%;text-align:center;font-size:12px;color:#a9a9b4;}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+
+  <div class="panel" id="pStart">
+    <div class="title">跳 一 跳</div>
+    <div class="sub">按住屏幕蓄力，松手起跳<br>距离越远按得越久（约 0.2 - 1.2 秒）<br>紫色圆圈是预测落点，对准盒子中心可连击加分</div>
+    <button class="btn" id="btnStart">开始游戏</button>
+    <div class="tip">电脑可用鼠标左键或空格键</div>
+  </div>
+
+  <div class="panel hidden" id="pOver">
+    <div class="sub">游戏结束</div>
+    <div class="big" id="ovScore">0</div>
+    <div class="why" id="ovWhy"></div>
+    <div class="best" id="ovBest">最高 0</div>
+    <div class="newrec hidden" id="ovRec">新纪录！</div>
+    <button class="btn" id="btnAgain">再来一局</button>
+    <div class="tip">点击任意位置重新开始</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ============================ 基础配置 ============================ */
+  var W = 480, H = 800;                 // 逻辑分辨率
+  var ISO_W = 0.866, ISO_H = 0.5;       // 等距投影系数 (cos30, sin30)
+  var SCALE = 92;                       // 世界单位 -> 像素
+
+  var CHARGE_SPEED = 1 / 1.30;          // 蓄满所需时间的倒数
+  var D_MIN = 1.80, D_SPAN = 3.05;      // 跳跃距离 = D_MIN + charge * D_SPAN
+  var OK_RATIO = 1.08;                  // 站住判定：|误差| <= 半宽 * OK_RATIO
+  var TIP_RATIO = 1.00;                 // 超过该比例（仍站住）则翻倒失败
+  var PERFECT_RATIO = 0.32;             // 中心判定比例
+  var STAY_TIME = 1.2;                  // 特殊盒子停留加分所需时间
+
+  var cv = document.getElementById('cv');
+  var ctx = cv.getContext('2d');
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  function resize() {
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  /* ============================ 音频 ============================ */
+  var actx = null, chargeOsc = null, chargeGain = null;
+
+  function initAudio() {
+    if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) actx = new AC();
+  }
+
+  function beep(f0, f1, dur, type, vol, delay) {
+    if (!actx) return;
+    var t0 = actx.currentTime + (delay || 0);
+    var o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f0, t0);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), t0 + dur);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol || 0.18, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0008, t0 + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+
+  function chargeSound(on) {
+    if (!actx) return;
+    if (on) {
+      if (chargeOsc) return;
+      chargeOsc = actx.createOscillator();
+      chargeGain = actx.createGain();
+      chargeOsc.type = 'sine';
+      chargeOsc.frequency.value = 220;
+      chargeGain.gain.value = 0;
+      chargeOsc.connect(chargeGain); chargeGain.connect(actx.destination);
+      chargeOsc.start();
+      chargeGain.gain.linearRampToValueAtTime(0.06, actx.currentTime + 0.06);
+    } else if (chargeOsc) {
+      var t = actx.currentTime;
+      chargeGain.gain.cancelScheduledValues(t);
+      chargeGain.gain.setValueAtTime(chargeGain.gain.value, t);
+      chargeGain.gain.linearRampToValueAtTime(0, t + 0.05);
+      chargeOsc.stop(t + 0.08);
+      chargeOsc = null; chargeGain = null;
+    }
+  }
+
+  function sfxJump() { beep(520, 1180, 0.13, 'sine', 0.16); }
+  function sfxLand() { beep(190, 96, 0.13, 'triangle', 0.24); }
+  function sfxPerfect(n) { beep(760 + n * 60, 1180 + n * 60, 0.16, 'sine', 0.2); beep(1180 + n * 60, 1560, 0.2, 'sine', 0.12, 0.07); }
+  function sfxFail() { beep(420, 90, 0.5, 'sawtooth', 0.13); }
+  function sfxBonus() { beep(880, 1320, 0.14, 'sine', 0.16); beep(1320, 1760, 0.18, 'sine', 0.1, 0.08); }
+  function sfxMusic() {
+    var m = [523, 659, 784, 1047];
+    for (var i = 0; i < m.length; i++) beep(m[i], m[i], 0.22, 'sine', 0.12, i * 0.13);
+  }
+  function vibrate(ms) { if (navigator.vibrate) { try { navigator.vibrate(ms); } catch (e) {} } }
+
+  /* ============================ 投影 / 工具 ============================ */
+  var cam = { x: W / 2, y: H * 0.62 };
+
+  function proj(x, y, z) {
+    return [
+      (x - y) * ISO_W * SCALE + cam.x,
+      (x + y) * ISO_H * SCALE - z * SCALE + cam.y
+    ];
+  }
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function path(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+  function quad(p0, p1, p2, p3, fill, stroke) {
+    path([p0, p1, p2, p3]);
+    ctx.fillStyle = fill; ctx.fill();
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke(); }
+  }
+  // 平行四边形内参数取点 (u 沿 +x, v 沿 +y)
+  function pv(c0, c1, c3, u, v) {
+    return [c0[0] + u * (c1[0] - c0[0]) + v * (c3[0] - c0[0]),
+            c0[1] + u * (c1[1] - c0[1]) + v * (c3[1] - c0[1])];
+  }
+
+  /* ============================ 游戏状态 ============================ */
+  var S = {
+    phase: 'ready',   // ready | idle | charging | flying | over
+    score: 0, combo: 0,
+    boxes: [],
+    cur: 0,           // 当前所在盒子下标
+    P: { x: 0, y: 0, z: 0, angle: 0, sx: 1, sy: 1 },
+    charge: 0,
+    jump: null,
+    stay: null,
+    floats: [],
+    shake: 0,
+    fallT: 0,
+    failKind: 'ok',
+    assist: true        // 蓄力时显示预测落点
+  };
+
+  var TYPES = ['normal', 'normal', 'normal', 'cylinder', 'cube', 'shop', 'music'];
+  var BONUS = { cube: 10, cylinder: 5, shop: 15, music: 30 };
+
+  function makeBox(x, y, type, forcedSize) {
+    var hw = forcedSize || rnd(0.42, 0.60);
+    return {
+      x: x, y: y, hw: hw, hd: hw,
+      h: rnd(0.45, 0.95),
+      type: type || 'normal',
+      appear: 0,
+      colors: randCubeColors(),
+      seed: Math.random()
+    };
+  }
+
+  function randCubeColors() {
+    var pal = ['#e94f4f', '#f2a03d', '#f7d84a', '#4cbf67', '#4aa8f0', '#f4f4f6'];
+    var c = [];
+    for (var i = 0; i < 9; i++) c.push(pal[(Math.random() * pal.length) | 0]);
+    return c;
+  }
+
+  var lastDir = 1, sameCount = 0;
+
+  function spawnNext() {
+    var prev = S.boxes[S.boxes.length - 1];
+    var dir;
+    if (sameCount >= 2) { dir = -lastDir; } else { dir = Math.random() < 0.5 ? 1 : -1; }
+    if (dir === lastDir) sameCount++; else sameCount = 1;
+    lastDir = dir;
+
+    var spread = 1.2 + Math.min(S.score * 0.035, 1.3);
+    var dist = 1.8 + Math.random() * spread;
+    var nx = prev.x + (dir > 0 ? -dist : 0);
+    var ny = prev.y + (dir > 0 ? 0 : -dist);
+
+    var t = S.boxes.length < 2 ? 'normal' : TYPES[(Math.random() * TYPES.length) | 0];
+    var b = makeBox(nx, ny, t);
+    b.appear = 0;
+    S.boxes.push(b);
+  }
+
+  function reset() {
+    S.phase = 'idle'; S.score = 0; S.combo = 0; S.charge = 0;
+    S.boxes = []; S.cur = 0; S.jump = null; S.stay = null;
+    S.floats = []; S.shake = 0; S.fallT = 0; S.failKind = 'ok';
+    lastDir = 1; sameCount = 0;
+
+    var b0 = makeBox(0, 0, 'normal', 0.55); b0.h = 0.62; b0.appear = 1;
+    S.boxes.push(b0);
+    var b1 = makeBox(-2.2, 0, 'normal', 0.55); b1.h = 0.62; b1.appear = 1;
+    S.boxes.push(b1);
+
+    S.P.x = b0.x; S.P.y = b0.y; S.P.z = b0.h; S.P.angle = 0; S.P.sx = 1; S.P.sy = 1;
+
+    var c = midPoint();
+    cam.x = W / 2 - (c[0] - c[1]) * ISO_W * SCALE;
+    cam.y = H * 0.56 - (c[0] + c[1]) * ISO_H * SCALE;
+  }
+
+  function midPoint() {
+    var a = S.boxes[S.cur], b = S.boxes[S.cur + 1];
+    if (!b) return [a.x, a.y];
+    return [(a.x + b.x) / 2, (a.y + b.y) / 2];
+  }
+
+  /* ============================ 输入 ============================ */
+  function press() {
+    if (S.phase !== 'idle') return;
+    initAudio();
+    S.phase = 'charging';
+    S.charge = 0;
+    S.stay = null;
+    chargeSound(true);
+  }
+
+  function release() {
+    if (S.phase !== 'charging') return;
+    chargeSound(false);
+    startJump();
+  }
+
+  function startJump() {
+    var to = S.boxes[S.cur + 1];
+    var charge = S.charge;
+    var D = D_MIN + charge * D_SPAN;
+
+    // 从棋子实际站立的位置瞄准下一个盒子中心（避免落点偏移累积）
+    var dx = to.x - S.P.x, dy = to.y - S.P.y;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / len, uy = dy / len;
+
+    var err = D - len;                                // 正=跳过头, 负=没跳到
+    var ok = Math.abs(err) <= to.hw * OK_RATIO;
+    var tip = Math.abs(err) <= to.hw * TIP_RATIO;     // 站在边缘会翻倒
+    var perfect = Math.abs(err) <= to.hw * PERFECT_RATIO;
+
+    var z1 = (ok && tip) ? to.h : -4.2;
+    var kind = 'ok';
+    if (!ok) kind = err > 0 ? 'far' : 'near';
+    else if (!tip) kind = 'edge';
+
+    S.jump = {
+      x0: S.P.x, y0: S.P.y, z0: S.P.z,
+      ux: ux, uy: uy, D: D, z1: z1,
+      t: 0, T: 0.42 + D * 0.05,
+      ok: ok && tip, perfect: perfect, to: to, err: err, kind: kind
+    };
+    S.phase = 'flying';
+    sfxJump();
+  }
+
+  function land() {
+    var j = S.jump;
+    S.P.x = j.x0 + j.ux * j.D;
+    S.P.y = j.y0 + j.uy * j.D;
+    S.P.z = j.z1;
+    S.P.angle = 0;
+
+    if (!j.ok) {                              // 掉落 / 翻倒
+      S.phase = 'over';
+      S.fallT = 0;
+      S.failKind = j.kind;
+      sfxFail(); vibrate(60);
+      return;
+    }
+
+    sfxLand(); vibrate(18);
+    var prevBox = S.boxes[S.cur];
+    S.cur += 1;
+    S.P.z = j.to.h;
+
+    var gain = 1;
+    if (j.perfect) {
+      S.combo += 1;
+      gain = 2 * S.combo;
+      sfxPerfect(S.combo);
+      addFloat('+' + gain, S.P.x, S.P.y, j.to.h + 1.3, '#e07b39', 30);
+      if (S.combo >= 2) addFloat('完美 x' + S.combo, S.P.x, S.P.y, j.to.h + 2.0, '#5b3fd6', 18);
+    } else {
+      S.combo = 0;
+      addFloat('+1', S.P.x, S.P.y, j.to.h + 1.2, '#6b6b78', 24);
+    }
+    S.score += gain;
+
+    // 特殊盒子：停留加分
+    var b = j.to;
+    if (BONUS[b.type]) {
+      S.stay = { box: b, t: 0, bonus: BONUS[b.type], done: false };
+      if (b.type === 'music') sfxMusic();
+    }
+
+    spawnNext();
+    S.phase = 'idle';
+    S.jump = null;
+  }
+
+  function addFloat(text, wx, wy, wz, color, size) {
+    S.floats.push({ text: text, x: wx, y: wy, z: wz, color: color, size: size || 22, life: 0 });
+  }
+
+  /* ============================ 绘制：盒子 ============================ */
+  var COL = {
+    normal:  { top: '#fbf6ec', right: '#eee4d2', left: '#dcd0bb' },
+    cube:    { top: '#f2f2f4', right: '#d9d9de', left: '#bfbfc7' },
+    cylinder:{ top: '#a7adb6', right: '#8b919b', left: '#757b85' },
+    shop:    { top: '#fdfdfd', right: '#e8e8ec', left: '#cfcfd6' },
+    music:   { top: '#f0cf7a', right: '#d9b25c', left: '#bd9646' }
+  };
+  var EDGE = 'rgba(90,80,60,.16)';
+
+  function drawBox(b) {
+    var ap = b.appear;
+    if (ap <= 0) return;
+    var ease = 1 - Math.pow(1 - ap, 3);
+    var zOff = (1 - ease) * -1.6;             // 从下方升起
+    var hw = b.hw, hd = b.hd, h = b.h;
+    var c0 = proj(b.x - hw, b.y - hd, h + zOff);
+    var c1 = proj(b.x + hw, b.y - hd, h + zOff);
+    var c2 = proj(b.x + hw, b.y + hd, h + zOff);
+    var c3 = proj(b.x - hw, b.y + hd, h + zOff);
+    var b1 = proj(b.x + hw, b.y - hd, zOff);
+    var b2 = proj(b.x + hw, b.y + hd, zOff);
+    var b3 = proj(b.x - hw, b.y + hd, zOff);
+
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, ap * 1.6);
+
+    if (b.type === 'cylinder' || b.type === 'music') {
+      drawCylinder(b, zOff);
+    } else {
+      var col = COL[b.type] || COL.normal;
+      // 左侧面 (+y)
+      quad(c3, c2, b2, b3, col.left, EDGE);
+      // 右侧面 (+x)
+      quad(c1, c2, b2, b1, col.right, EDGE);
+      // 顶面
+      quad(c0, c1, c2, c3, col.top, EDGE);
+
+      if (b.type === 'cube') drawCubeFace(c0, c1, c3, b);
+      if (b.type === 'shop') drawShopFace(c0, c1, c3, c1, c2, b1);
+    }
+    ctx.restore();
+  }
+
+  function drawCylinder(b, zOff) {
+    var col = COL[b.type] || COL.cylinder;
+    var cc = proj(b.x, b.y, b.h + zOff);
+    var rx = Math.SQRT2 * b.hw * ISO_W * SCALE;
+    var ry = Math.SQRT2 * b.hw * ISO_H * SCALE;
+    var hs = b.h * SCALE;
+
+    ctx.beginPath();
+    ctx.moveTo(cc[0] - rx, cc[1]);
+    ctx.lineTo(cc[0] - rx, cc[1] + hs);
+    ctx.ellipse(cc[0], cc[1] + hs, rx, ry, 0, Math.PI, 0, true);
+    ctx.lineTo(cc[0] + rx, cc[1]);
+    ctx.closePath();
+    var g = ctx.createLinearGradient(cc[0] - rx, 0, cc[0] + rx, 0);
+    g.addColorStop(0, col.left); g.addColorStop(0.45, col.right); g.addColorStop(1, col.left);
+    ctx.fillStyle = g; ctx.fill();
+
+    ctx.beginPath();
+    ctx.ellipse(cc[0], cc[1], rx, ry, 0, 0, Math.PI * 2);
+    ctx.fillStyle = col.top; ctx.fill();
+    ctx.strokeStyle = EDGE; ctx.lineWidth = 1; ctx.stroke();
+
+    if (b.type === 'cylinder') {
+      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(cc[0], cc[1], rx * 0.62, ry * 0.62, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(cc[0], cc[1], rx * 0.24, ry * 0.24, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = 'rgba(0,0,0,.16)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(cc[0] - rx * 0.9, cc[1]); ctx.lineTo(cc[0] + rx * 0.9, cc[1]); ctx.stroke();
+    } else {
+      ctx.fillStyle = '#7a5a20';
+      ctx.font = 'bold 30px serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('♪', cc[0], cc[1] + 1);
+    }
+  }
+
+  function drawCubeFace(c0, c1, c3, b) {
+    for (var i = 0; i < 3; i++) {
+      for (var j = 0; j < 3; j++) {
+        var u0 = i / 3, u1 = (i + 1) / 3, v0 = j / 3, v1 = (j + 1) / 3;
+        var p0 = pv(c0, c1, c3, u0, v0), p1 = pv(c0, c1, c3, u1, v0);
+        var p2 = pv(c0, c1, c3, u1, v1), p3 = pv(c0, c1, c3, u0, v1);
+        quad(p0, p1, p2, p3, b.colors[i * 3 + j], 'rgba(0,0,0,.12)');
+      }
+    }
+  }
+
+  function drawShopFace(c0, c1, c3, r1, r2, rb1) {
+    // 顶面招牌
+    var p0 = pv(c0, c1, c3, 0.18, 0.18), p1 = pv(c0, c1, c3, 0.82, 0.18);
+    var p2 = pv(c0, c1, c3, 0.82, 0.5), p3 = pv(c0, c1, c3, 0.18, 0.5);
+    quad(p0, p1, p2, p3, '#4cbf67', 'rgba(0,0,0,.12)');
+    // 右侧面：门
+    var d0 = pv(r1, r2, rb1, 0.3, 0.12), d1 = pv(r1, r2, rb1, 0.72, 0.12);
+    var d2 = pv(r1, r2, rb1, 0.72, 0.95), d3 = pv(r1, r2, rb1, 0.3, 0.95);
+    quad(d0, d1, d2, d3, '#9aa0a8', 'rgba(0,0,0,.12)');
+  }
+
+  /* ============================ 绘制：棋子 ============================ */
+  function drawPlayer() {
+    var P = S.P;
+    var s = proj(P.x, P.y, P.z);
+    var groundZ = S.boxes[S.cur] ? S.boxes[S.cur].h : 0;
+    var airH = clamp(P.z - groundZ, 0, 3);
+    var alpha = clamp(1 - airH / 2.4, 0, 1) * 0.22;
+
+    if (alpha > 0.01) {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.ellipse(s[0], s[1], 16 * (1 - airH * 0.12), 8 * (1 - airH * 0.12), 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(s[0], s[1]);
+    ctx.rotate(P.angle);
+    ctx.scale(P.sx, P.sy);
+
+    // 身体（梯形）
+    var g = ctx.createLinearGradient(-18, 0, 18, -40);
+    g.addColorStop(0, '#7d5cf5'); g.addColorStop(1, '#5b3fd6');
+    ctx.beginPath();
+    ctx.moveTo(-15, 0);
+    ctx.lineTo(15, 0);
+    ctx.lineTo(11, -34);
+    ctx.lineTo(-11, -34);
+    ctx.closePath();
+    ctx.fillStyle = g; ctx.fill();
+
+    // 头
+    ctx.beginPath();
+    ctx.arc(0, -46, 14, 0, Math.PI * 2);
+    ctx.fillStyle = '#fdfdfd'; ctx.fill();
+
+    // 眼睛 + 嘴
+    ctx.fillStyle = '#3a3a44';
+    ctx.beginPath(); ctx.arc(-5, -48, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5, -48, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#3a3a44'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(0, -44, 4, 0.25 * Math.PI, 0.75 * Math.PI); ctx.stroke();
+
+    ctx.restore();
+  }
+
+  /* ============================ 绘制：落点辅助 ============================ */
+  function drawAssist() {
+    if (S.phase !== 'charging' || !S.assist) return;
+    var to = S.boxes[S.cur + 1];
+    if (!to) return;
+    var dx = to.x - S.P.x, dy = to.y - S.P.y;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var D = D_MIN + S.charge * D_SPAN;
+    var lx = S.P.x + dx / len * D, ly = S.P.y + dy / len * D;
+
+    var p = proj(lx, ly, to.h + 0.02);
+    var r = 0.19;
+    var rx = Math.SQRT2 * r * ISO_W * SCALE;
+    var ry = Math.SQRT2 * r * ISO_H * SCALE;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(p[0], p[1], rx, ry, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(91,63,214,.14)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(91,63,214,.6)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /* ============================ 绘制：HUD ============================ */
+  function drawHUD() {
+    ctx.save();
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#43434e';
+    ctx.font = '800 62px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(String(S.score), W / 2, 108);
+
+    ctx.fillStyle = '#a7a7b2';
+    ctx.font = '600 13px -apple-system,"PingFang SC",sans-serif';
+    ctx.fillText('最高 ' + bestScore(), W / 2, 132);
+
+    // 蓄力条
+    if (S.phase === 'charging') {
+      var bw = 176, bh = 7, bx = (W - bw) / 2, by = H - 54;
+      ctx.fillStyle = 'rgba(0,0,0,.07)';
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(bx, by, bw, bh, 4) : ctx.rect(bx, by, bw, bh);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(91,63,214,.85)';
+      ctx.beginPath();
+      var fw = Math.max(6, bw * S.charge);
+      ctx.roundRect ? ctx.roundRect(bx, by, fw, bh, 4) : ctx.rect(bx, by, fw, bh);
+      ctx.fill();
+    }
+
+    // 停留加分进度
+    if (S.stay && !S.stay.done) {
+      var sp = proj(S.stay.box.x, S.stay.box.y, S.stay.box.h + 1.6);
+      var r = S.stay.t / STAY_TIME;
+      ctx.strokeStyle = 'rgba(0,0,0,.12)'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], 15, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = '#e07b39'; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], 15, -Math.PI / 2, -Math.PI / 2 + r * Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = '#e07b39';
+      ctx.font = '700 13px sans-serif'; ctx.textBaseline = 'middle';
+      ctx.fillText('+' + S.stay.bonus, sp[0], sp[1] + 30);
+    }
+
+    // 浮动文字
+    for (var i = 0; i < S.floats.length; i++) {
+      var f = S.floats[i];
+      var p = proj(f.x, f.y, f.z + f.life * 1.1);
+      var a = clamp(1 - f.life / 1.1, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = f.color;
+      ctx.font = '800 ' + f.size + 'px -apple-system,"PingFang SC",sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(f.text, p[0], p[1]);
+      ctx.globalAlpha = 1;
+    }
+
+    // 右上角：落点辅助开关（点击可切换）
+    ctx.textAlign = 'right';
+    ctx.fillStyle = S.assist ? 'rgba(91,63,214,.75)' : 'rgba(150,150,160,.7)';
+    ctx.font = '700 13px -apple-system,"PingFang SC",sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(S.assist ? '落点辅助 开' : '落点辅助 关', W - 16, 32);
+    ctx.restore();
+  }
+
+  function bestScore() {
+    var v = 0;
+    try { v = parseInt(localStorage.getItem('tyt_best') || '0', 10) || 0; } catch (e) {}
+    return v;
+  }
+  function saveBest(v) {
+    try { localStorage.setItem('tyt_best', String(v)); } catch (e) {}
+  }
+
+  /* ============================ 主循环 ============================ */
+  function update(dt) {
+    // 盒子出现动画
+    for (var i = 0; i < S.boxes.length; i++) {
+      if (S.boxes[i].appear < 1) S.boxes[i].appear = Math.min(1, S.boxes[i].appear + dt * 3.2);
+    }
+    // 浮动文字
+    for (var k = S.floats.length - 1; k >= 0; k--) {
+      S.floats[k].life += dt;
+      if (S.floats[k].life > 1.1) S.floats.splice(k, 1);
+    }
+
+    if (S.phase === 'charging') {
+      S.charge = Math.min(1, S.charge + dt * CHARGE_SPEED);
+      S.P.sy = 1 - S.charge * 0.3;
+      S.P.sx = 1 + S.charge * 0.14;
+      if (chargeOsc && actx) chargeOsc.frequency.setValueAtTime(220 + S.charge * 460, actx.currentTime);
+    } else if (S.phase === 'flying') {
+      var j = S.jump;
+      j.t += dt / j.T;
+      var t = Math.min(1, j.t);
+      S.P.x = j.x0 + j.ux * j.D * t;
+      S.P.y = j.y0 + j.uy * j.D * t;
+      var zBase = lerp(j.z0, j.z1, t);
+      var peak = 1.0 + j.D * 0.18;
+      S.P.z = zBase + peak * 4 * t * (1 - t);
+      S.P.angle = t * Math.PI * 2;
+      S.P.sx = 1; S.P.sy = 1;
+      if (j.t >= 1) {
+        if (j.ok) { land(); }
+        else { S.phase = 'over'; S.fallT = 0; S.failKind = j.kind; sfxFail(); vibrate(60); }
+      }
+    } else if (S.phase === 'over') {
+      S.fallT += dt;
+      if (S.jump && !S.jump.ok) {
+        S.P.z -= dt * (6 + S.fallT * 14);
+        S.P.angle += dt * 6;
+        S.P.x += (S.jump.ux * dt * 0.6);
+        S.P.y += (S.jump.uy * dt * 0.6);
+      }
+      if (S.fallT > 0.55 && !S.overShown) { S.overShown = true; showOver(); }
+    } else if (S.phase === 'idle') {
+      S.P.sx = lerp(S.P.sx, 1, 0.2);
+      S.P.sy = lerp(S.P.sy, 1, 0.2);
+      if (S.stay && !S.stay.done) {
+        S.stay.t += dt;
+        if (S.stay.t >= STAY_TIME) {
+          S.stay.done = true;
+          S.score += S.stay.bonus;
+          addFloat('+' + S.stay.bonus, S.stay.box.x, S.stay.box.y, S.stay.box.h + 1.4, '#4cbf67', 26);
+          sfxBonus();
+          S.stay = null;
+        }
+      }
+    }
+
+    updateCam(dt);
+  }
+
+  function updateCam(dt) {
+    var tx, ty, tz, k;
+    if (S.phase === 'flying' || S.phase === 'over') {
+      tx = S.P.x; ty = S.P.y; tz = S.P.z; k = 0.5;
+    } else {
+      var c = midPoint();
+      tx = c[0]; ty = c[1]; tz = 0; k = 0.56;
+    }
+    var px = (tx - ty) * ISO_W * SCALE;
+    var py = (tx + ty) * ISO_H * SCALE - tz * SCALE;
+    var gx = W / 2 - px;
+    var gy = H * k - py;
+    var s = S.phase === 'flying' ? 0.10 : 0.14;
+    cam.x = lerp(cam.x, gx, s);
+    cam.y = lerp(cam.y, gy, s);
+  }
+
+  function draw() {
+    // 背景
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#f7f8fa');
+    g.addColorStop(0.55, '#eef0f4');
+    g.addColorStop(1, '#e3e6ec');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 由远及近绘制
+    for (var i = S.boxes.length - 1; i >= 0; i--) drawBox(S.boxes[i]);
+    if (S.phase !== 'over' || S.fallT < 1.2) drawPlayer();
+    drawAssist();
+
+    drawHUD();
+  }
+
+  var last = 0;
+  function frame(ts) {
+    if (!last) last = ts;
+    var dt = Math.min((ts - last) / 1000, 0.05);
+    last = ts;
+    if (S.phase !== 'ready') update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ============================ 界面 ============================ */
+  var pStart = document.getElementById('pStart');
+  var pOver = document.getElementById('pOver');
+
+  var WHY = { far: '跳过头了，下次松手早一点', near: '差一点点，再按久一些', edge: '踩到边上了，没站稳', ok: '' };
+
+  function showOver() {
+    document.getElementById('ovScore').textContent = S.score;
+    document.getElementById('ovWhy').textContent = WHY[S.failKind || 'ok'] || '';
+    var b = bestScore();
+    if (S.score > b) { saveBest(S.score); b = S.score; document.getElementById('ovRec').classList.remove('hidden'); }
+    else document.getElementById('ovRec').classList.add('hidden');
+    document.getElementById('ovBest').textContent = '最高 ' + b;
+    pOver.classList.remove('hidden');
+  }
+
+  function startGame() {
+    initAudio();
+    S.overShown = false;
+    reset();
+    pStart.classList.add('hidden');
+    pOver.classList.add('hidden');
+  }
+
+  pStart.addEventListener('click', function () { if (S.phase === 'ready') startGame(); });
+  pOver.addEventListener('click', function () { startGame(); });
+
+  // 输入绑定
+  function toLocal(cx, cy) {
+    var r = cv.getBoundingClientRect();
+    return [(cx - r.left) / r.width * W, (cy - r.top) / r.height * H];
+  }
+  function hitAssist(p) { return p[0] > W - 120 && p[0] < W && p[1] > 12 && p[1] < 52; }
+
+  function down(cx, cy) {
+    if (S.phase === 'ready') { startGame(); return; }
+    if (S.phase === 'over') return;
+    if (cx !== undefined) {
+      var p = toLocal(cx, cy);
+      if (hitAssist(p)) { S.assist = !S.assist; return; }
+    }
+    press();
+  }
+
+  cv.addEventListener('mousedown', function (e) { e.preventDefault(); down(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', function () { release(); });
+  cv.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    var t = e.changedTouches[0];
+    down(t.clientX, t.clientY);
+  }, { passive: false });
+  window.addEventListener('touchend', function () { release(); });
+  window.addEventListener('touchcancel', function () { release(); });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (S.phase === 'ready') startGame();
+      else press();
+    }
+  });
+  window.addEventListener('keyup', function (e) { if (e.code === 'Space') release(); });
+  window.addEventListener('blur', function () { release(); });
+
+  // 初始画面
+  reset();
+  S.phase = 'ready';
+})();
+</script>
+</body>
+</html>
